@@ -1,0 +1,274 @@
+# User data PowerShell script for Windows Failover Cluster with SQL Server 2022
+# Using FSx for Windows File Server as shared storage for SQL FCI (active/passive)
+
+<powershell>
+# Set the execution policy to allow scripts 
+Set-ExecutionPolicy Unrestricted -Force
+
+# Enable logging for troubleshooting
+Start-Transcript -Path "C:\cfn\log\userdata_transcript.txt" -Append
+Write-Host "Starting Windows Failover Cluster configuration for SQL FCI..."
+
+# Create Log Directory if it doesn't exist
+if (-not (Test-Path "C:\cfn\log")) {
+    New-Item -Path "C:\cfn\log" -ItemType Directory -Force
+}
+
+# Define node-specific information
+$NodeIndex = ${node_index}
+$NodeCount = ${node_count}
+$IsFirstNode = ($NodeIndex -eq 0)
+$NodeName = $env:COMPUTERNAME
+$ClusterName = "${cluster_name}"
+$ClusterIP = "${cluster_ip}"
+$DomainName = "${domain_name}"
+$FSxDNSName = "${fsx_dns_name}"
+$FSxShareName = "${fsx_mount_name}"
+$WitnessShareName = "${witness_share_name}"
+$SqlInstanceName = "MSSQLSERVER"
+
+# Join domain
+$secpasswd = ConvertTo-SecureString "${domain_admin_password}" -AsPlainText -Force
+$mycreds = New-Object System.Management.Automation.PSCredential ("${domain_name}\\Administrator", $secpasswd)
+Add-Computer -DomainName $DomainName -Credential $mycreds -Restart -Force
+
+# Exit script if computer isn't joined to domain yet
+# Script will continue after reboot
+if ((Get-WmiObject Win32_ComputerSystem).PartOfDomain -eq $false) {
+    Write-Host "Computer not joined to domain yet. Exiting script to allow reboot."
+    exit 0
+}
+
+# Get other node names for the cluster
+$NodePrefix = "windowsfc-sqlnode-"
+$NodeNames = @()
+for ($i = 1; $i -le $NodeCount; $i++) {
+    $NodeNames += "$NodePrefix$i"
+}
+
+# Step 1: Install required Windows Features
+Write-Host "Installing required Windows features..."
+Install-WindowsFeature -Name Failover-Clustering, RSAT-Clustering-PowerShell, RSAT-Clustering-Mgmt, RSAT-AD-PowerShell, FS-FileServer
+
+# Step 2: Mount FSx file share for cluster storage
+Write-Host "Mounting FSx file share..."
+$FSxSharePath = "\\$FSxDNSName\$FSxShareName"
+New-PSDrive -Name "F" -PSProvider FileSystem -Root $FSxSharePath -Persist
+
+# Create folders for SQL Server data on FSx (only on first node)
+if ($IsFirstNode) {
+    Write-Host "Creating SQL Server directories on FSx..."
+    $Folders = @("SQLData", "SQLLogs", "SQLBackup", "SQLSystem", $WitnessShareName)
+    foreach ($Folder in $Folders) {
+        $Path = "F:\$Folder"
+        if (-not (Test-Path $Path)) {
+            New-Item -Path $Path -ItemType Directory -Force
+        }
+    }
+}
+
+# Step 3: Configure Windows Firewall for SQL Server and Cluster
+Write-Host "Configuring Windows Firewall..."
+# SQL Server (TCP 1433)
+New-NetFirewallRule -DisplayName "SQL Server" -Direction Inbound -Protocol TCP -LocalPort 1433 -Action Allow
+# SQL Server Admin Connection (TCP 1434)
+New-NetFirewallRule -DisplayName "SQL Server Admin Connection" -Direction Inbound -Protocol TCP -LocalPort 1434 -Action Allow
+# SQL Server Browser Service (UDP 1434)
+New-NetFirewallRule -DisplayName "SQL Server Browser Service" -Direction Inbound -Protocol UDP -LocalPort 1434 -Action Allow
+# Windows Failover Cluster communication
+New-NetFirewallRule -DisplayName "Windows Failover Cluster" -Direction Inbound -Protocol TCP -LocalPort 3343 -Action Allow
+# Windows Remote Management
+New-NetFirewallRule -DisplayName "Windows Remote Management" -Direction Inbound -Protocol TCP -LocalPort @(5985, 5986) -Action Allow
+
+# Step 4: Create Windows Failover Cluster (only on first node)
+if ($IsFirstNode) {
+    Write-Host "Creating Windows Failover Cluster..."
+    
+    # Test if all nodes are ready for clustering
+    $TestResult = Test-Cluster -Node $NodeNames 
+    Write-Host "Cluster Test Result: $TestResult"
+    
+    # Create the cluster
+    New-Cluster -Name $ClusterName -Node $NodeNames -NoStorage -StaticAddress $ClusterIP
+    
+    # Configure cluster quorum with file share witness
+    $WitnessSharePath = "\\$FSxDNSName\$WitnessShareName"
+    Set-ClusterQuorum -FileShareWitness $WitnessSharePath
+    
+    # Wait for cluster to stabilize
+    Start-Sleep -Seconds 30
+    
+    # Download and install SQL Server 2022 Enterprise Evaluation (first as clustered)
+    Write-Host "Downloading and installing SQL Server 2022 Enterprise for Cluster..."
+    $SqlInstaller = "https://go.microsoft.com/fwlink/?linkid=2216019"  # SQL 2022 Enterprise Eval ISO
+    $SqlIso = "C:\Windows\Temp\SQLEnterprise2022.iso"
+    Invoke-WebRequest -Uri $SqlInstaller -OutFile $SqlIso
+
+    # Mount ISO
+    $mountResult = Mount-DiskImage -ImagePath $SqlIso -PassThru
+    $sqldrive = ($mountResult | Get-Volume).DriveLetter + ":"
+
+    # Define SQL Server file locations on FSx
+    $SqlData = "F:\SQLData"
+    $SqlLogs = "F:\SQLLogs"
+    $SqlBackup = "F:\SQLBackup"
+    $SqlTempDB = "C:\SQLTEMPDB" # Keep TempDB local for performance
+    
+    # Install SQL Server as a failover clustered instance
+    $setupPath = "$sqldrive\setup.exe"
+    $SqlArgs = "/Q /ACTION=InstallFailoverCluster /INSTANCENAME=$SqlInstanceName " + `
+               "/FAILOVERCLUSTERNETWORKNAME=$ClusterName " + `
+               "/FAILOVERCLUSTERIPADDRESSES=`"IPv4;$ClusterIP;Cluster Network 1;255.255.255.0`" " + `
+               "/FAILOVERCLUSTERGROUP=`"SQL Server ($SqlInstanceName)`" " + `
+               "/FEATURES=SQLEngine " + `
+               "/SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" " + `
+               "/SQLSYSADMINACCOUNTS=`"${domain_name}\Administrator`" " + `
+               "/AGTSVCACCOUNT=`"NT AUTHORITY\Network Service`" " + `
+               "/INSTALLSQLDATADIR=`"$SqlData`" " + `
+               "/SQLUSERDBDIR=`"$SqlData`" " + `
+               "/SQLUSERDBLOGDIR=`"$SqlLogs`" " + `
+               "/SQLBACKUPDIR=`"$SqlBackup`" " + `
+               "/SQLTEMPDBDIR=`"$SqlTempDB`" " + `
+               "/SQLTEMPDBLOGDIR=`"$SqlTempDB`" " + `
+               "/IACCEPTSQLSERVERLICENSETERMS /SQLCOLLATION=SQL_Latin1_General_CP1_CI_AS " + `
+               "/SECURITYMODE=SQL /SAPWD=`"${sql_server_admin_password}`" " + `
+               "/TCPENABLED=1 /HIDECONSOLEOUTPUT=0"
+               
+    Write-Host "Installing SQL Server Failover Cluster Instance (Primary Node)..."
+    Write-Host "SQL Args: $SqlArgs"
+    Start-Process -FilePath $setupPath -ArgumentList $SqlArgs -Wait -NoNewWindow
+    
+    # Dismount ISO
+    Dismount-DiskImage -ImagePath $SqlIso
+}
+else {
+    # Secondary node - wait for primary to set up the cluster
+    Write-Host "This is a secondary node. Waiting for cluster to be ready..."
+    Start-Sleep -Seconds 300  # Wait 5 minutes for the primary node to set up the cluster
+    
+    # Download and install SQL Server 2022 Enterprise for cluster add node
+    Write-Host "Downloading and installing SQL Server 2022 Enterprise (Add Node)..."
+    $SqlInstaller = "https://go.microsoft.com/fwlink/?linkid=2216019"  # SQL 2022 Enterprise Eval ISO
+    $SqlIso = "C:\Windows\Temp\SQLEnterprise2022.iso"
+    Invoke-WebRequest -Uri $SqlInstaller -OutFile $SqlIso
+
+    # Mount ISO
+    $mountResult = Mount-DiskImage -ImagePath $SqlIso -PassThru
+    $sqldrive = ($mountResult | Get-Volume).DriveLetter + ":"
+    
+    # Add this node to the existing SQL Server failover cluster
+    $setupPath = "$sqldrive\setup.exe"
+    $SqlArgs = "/Q /ACTION=AddNode " + `
+               "/INSTANCENAME=$SqlInstanceName " + `
+               "/FAILOVERCLUSTERNETWORKNAME=$ClusterName " + `
+               "/SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" " + `
+               "/SQLSYSADMINACCOUNTS=`"${domain_name}\Administrator`" " + `
+               "/AGTSVCACCOUNT=`"NT AUTHORITY\Network Service`" " + `
+               "/IACCEPTSQLSERVERLICENSETERMS " + `
+               "/TCPENABLED=1 /HIDECONSOLEOUTPUT=0"
+               
+    Write-Host "Adding node to SQL Server Failover Cluster Instance..."
+    Write-Host "SQL Args: $SqlArgs"
+    Start-Process -FilePath $setupPath -ArgumentList $SqlArgs -Wait -NoNewWindow
+    
+    # Dismount ISO
+    Dismount-DiskImage -ImagePath $SqlIso
+}
+
+# Step 5: Create a sample database (only on first node)
+if ($IsFirstNode) {
+    Write-Host "Creating a sample database..."
+    Start-Sleep -Seconds 60  # Wait for SQL Server to be fully operational
+    
+    # Create a simple test database on the cluster
+    $SqlQuery = @"
+CREATE DATABASE [TestDB]
+ON PRIMARY 
+( NAME = N'TestDB', FILENAME = N'F:\SQLData\TestDB.mdf' )
+LOG ON 
+( NAME = N'TestDB_log', FILENAME = N'F:\SQLLogs\TestDB_log.ldf' )
+GO
+"@
+    
+    # Save query to a file and execute with sqlcmd
+    $SqlQuery | Out-File -FilePath "C:\Windows\Temp\create_db.sql" -Encoding ASCII
+    & sqlcmd -S localhost -i "C:\Windows\Temp\create_db.sql" -E
+}
+
+# Step 6: Install and configure CloudWatch agent
+Write-Host "Installing CloudWatch agent..."
+$CWAgentUrl = "https://s3.amazonaws.com/amazoncloudwatch-agent/windows/amd64/latest/amazon-cloudwatch-agent.msi"
+$CWAgentInstaller = "C:\Windows\Temp\amazon-cloudwatch-agent.msi"
+Invoke-WebRequest -Uri $CWAgentUrl -OutFile $CWAgentInstaller
+Start-Process msiexec.exe -ArgumentList "/i $CWAgentInstaller /qn" -Wait
+
+# Configure CloudWatch agent (basic config)
+$CWConfig = @"
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "logfile": "c:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\Logs\\amazon-cloudwatch-agent.log"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "C:\\cfn\\log\\userdata_transcript.txt",
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/userdata_transcript",
+            "timestamp_format": "%H:%M:%S %y/%m/%d"
+          },
+          {
+            "file_path": "C:\\Windows\\System32\\winevt\\Logs\\Application.evtx",
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/Application",
+            "event_format": "xml"
+          },
+          {
+            "file_path": "C:\\Windows\\System32\\winevt\\Logs\\System.evtx",
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/System",
+            "event_format": "xml"
+          }
+        ]
+      },
+      "windows_events": {
+        "collect_list": [
+          {
+            "event_name": "Application",
+            "event_levels": ["ERROR", "WARNING", "INFORMATION"],
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/ApplicationEvents"
+          },
+          {
+            "event_name": "System",
+            "event_levels": ["ERROR", "WARNING", "INFORMATION"],
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/SystemEvents"
+          },
+          {
+            "event_name": "Microsoft-Windows-FailoverClustering/Operational",
+            "event_levels": ["ERROR", "WARNING", "INFORMATION"],
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/FailoverClusterEvents"
+          },
+          {
+            "event_name": "Microsoft-Windows-MSSQLSERVER/Operational",
+            "event_levels": ["ERROR", "WARNING", "INFORMATION"],
+            "log_group_name": "${cloudwatch_log_group}",
+            "log_stream_name": "{instance_id}/SQLServerEvents"
+          }
+        ]
+      }
+    }
+  }
+}
+"@
+$CWConfigPath = "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\cwconfig.json"
+$CWConfig | Out-File -FilePath $CWConfigPath -Encoding ascii
+& "C:\\Program Files\\Amazon\\AmazonCloudWatchAgent\\amazon-cloudwatch-agent-ctl.ps1" -a fetch-config -m ec2 -c file:$CWConfigPath -s
+
+Write-Host "Configuration complete!"
+Stop-Transcript
+</powershell>
