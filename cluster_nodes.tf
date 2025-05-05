@@ -49,8 +49,9 @@ resource "aws_instance" "cluster_nodes" {
     cloudwatch_log_group       = var.cloudwatch_log_group
     node_index                 = count.index
     node_count                 = 2
-    cluster_name               = "SQLCLUSTER"
+    cluster_name               = var.cluster_name
     cluster_ip                 = var.cluster_ip
+    witness_share_name         = var.witness_share_name
   })
 
   # Avoid dependency cycle issues
@@ -58,4 +59,41 @@ resource "aws_instance" "cluster_nodes" {
     aws_directory_service_directory.ad,
     aws_fsx_windows_file_system.fsx
   ]
+}
+
+# Schedule the cluster test to run once deployment is complete
+resource "null_resource" "run_cluster_tests" {
+  # Run the tests only after both nodes are fully deployed
+  depends_on = [aws_instance.cluster_nodes]
+
+  # Run the test 30 minutes after deployment to ensure everything is running
+  # This uses a provisioner to execute a command on the local machine that runs terraform
+  provisioner "local-exec" {
+    command = <<EOT
+      # Wait for cluster to fully initialize (30 minutes)
+      echo "Waiting 30 minutes for cluster to fully initialize before running tests..."
+      sleep 1800
+      
+      # Use AWS Systems Manager to execute the test script on the primary node
+      aws ssm send-command \
+        --document-name "AWS-RunPowerShellScript" \
+        --targets "Key=tag:Name,Values=windowsfc-sqlnode-1" \
+        --parameters "commands=[
+          \"$${content}\"
+        ]" \
+        --region ${var.region} \
+        --output text
+    EOT
+    
+    environment = {
+      content = templatefile("${path.module}/scripts/cluster_tests.ps1.tftpl", {
+        domain_name                = var.domain_name
+        cloudwatch_log_group       = var.cloudwatch_log_group
+        fsx_dns_name               = aws_fsx_windows_file_system.fsx.dns_name
+        fsx_mount_name             = aws_fsx_windows_file_system.fsx.windows_volume_configuration[0].file_system_mount_point
+        cluster_name               = var.cluster_name
+        witness_share_name         = var.witness_share_name
+      })
+    }
+  }
 }

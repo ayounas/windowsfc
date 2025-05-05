@@ -1,0 +1,392 @@
+# PowerShell unit test script for validating SQL Server Failover Cluster
+# This script performs tests on both cluster nodes and verifies failover functionality
+
+<powershell>
+# Enable detailed logging
+Set-ExecutionPolicy Unrestricted -Force
+$CurrentDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$TestResultsPath = "C:\ClusterTests\TestResults_$($CurrentDate.Replace(':', '-').Replace(' ', '_')).log"
+$CloudWatchLogGroup = "${cloudwatch_log_group}"
+$CloudWatchLogStream = "ClusterTests_$($CurrentDate.Replace(':', '-').Replace(' ', '_'))"
+
+# Create directory for test results
+if (-not (Test-Path "C:\ClusterTests")) {
+    New-Item -Path "C:\ClusterTests" -ItemType Directory -Force | Out-Null
+}
+
+# Start transcript for detailed logging
+Start-Transcript -Path $TestResultsPath -Append
+
+# Helper function to log test results
+function Write-TestResult {
+    param (
+        [string]$TestName,
+        [string]$Result,
+        [string]$Details = ""
+    )
+    
+    $LogEntry = "[$CurrentDate] TEST: $TestName - RESULT: $Result"
+    if ($Details) {
+        $LogEntry += " - DETAILS: $Details"
+    }
+    
+    Write-Host $LogEntry
+    $LogEntry | Out-File -FilePath $TestResultsPath -Append
+}
+
+# Helper function to send logs to CloudWatch
+function Send-ToCloudWatch {
+    param (
+        [string]$Message
+    )
+    
+    $logEvent = @{
+        timestamp = [Math]::Floor([decimal](Get-Date -UFormat "%s"))
+        message = $Message
+    } | ConvertTo-Json
+    
+    $awsCommand = "aws logs put-log-events --log-group-name $CloudWatchLogGroup --log-stream-name $CloudWatchLogStream --log-events '$logEvent'"
+    Invoke-Expression $awsCommand
+}
+
+# Initialize CloudWatch log stream
+Write-Host "Initializing CloudWatch log stream..."
+try {
+    $createStreamCmd = "aws logs create-log-stream --log-group-name $CloudWatchLogGroup --log-stream-name $CloudWatchLogStream"
+    Invoke-Expression $createStreamCmd
+    Write-Host "CloudWatch log stream initialized successfully."
+} catch {
+    Write-Host "Failed to initialize CloudWatch log stream: $_"
+}
+
+# Get basic system info
+$ComputerInfo = Get-ComputerInfo
+$NodeName = $env:COMPUTERNAME
+$DomainInfo = Get-WmiObject Win32_ComputerSystem | Select-Object -ExpandProperty Domain
+
+Write-TestResult -TestName "NodeIdentification" -Result "INFO" -Details "Running tests on node: $NodeName in domain: $DomainInfo"
+Send-ToCloudWatch -Message "[$CurrentDate] TEST: NodeIdentification - RESULT: INFO - DETAILS: Running tests on node: $NodeName in domain: $DomainInfo"
+
+# Test 1: Verify Windows Failover Clustering Feature is installed
+Write-Host "Testing if Failover Clustering feature is installed..."
+$FailoverClusterFeature = Get-WindowsFeature -Name "Failover-Clustering"
+if ($FailoverClusterFeature.Installed) {
+    Write-TestResult -TestName "FailoverClusteringFeature" -Result "PASS" -Details "Failover Clustering feature is installed."
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: FailoverClusteringFeature - RESULT: PASS - DETAILS: Failover Clustering feature is installed."
+} else {
+    Write-TestResult -TestName "FailoverClusteringFeature" -Result "FAIL" -Details "Failover Clustering feature is not installed."
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: FailoverClusteringFeature - RESULT: FAIL - DETAILS: Failover Clustering feature is not installed."
+}
+
+# Test 2: Verify if part of a Failover Cluster
+Write-Host "Testing if node is part of a Failover Cluster..."
+try {
+    $ClusterInfo = Get-Cluster -ErrorAction Stop
+    Write-TestResult -TestName "ClusterMembership" -Result "PASS" -Details "Node is a member of cluster: $($ClusterInfo.Name)"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: ClusterMembership - RESULT: PASS - DETAILS: Node is a member of cluster: $($ClusterInfo.Name)"
+    
+    # Get additional cluster details
+    $ClusterNodes = Get-ClusterNode
+    $NodeCount = $ClusterNodes.Count
+    $NodeDetails = ($ClusterNodes | ForEach-Object { "$($_.Name) (State: $($_.State))" }) -join ", "
+    
+    Write-TestResult -TestName "ClusterNodeCount" -Result "INFO" -Details "Cluster has $NodeCount nodes: $NodeDetails"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: ClusterNodeCount - RESULT: INFO - DETAILS: Cluster has $NodeCount nodes: $NodeDetails"
+    
+    # Test cluster quorum configuration
+    $QuorumConfig = Get-ClusterQuorum
+    Write-TestResult -TestName "ClusterQuorum" -Result "INFO" -Details "Quorum type: $($QuorumConfig.QuorumType), Resource: $($QuorumConfig.QuorumResource)"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: ClusterQuorum - RESULT: INFO - DETAILS: Quorum type: $($QuorumConfig.QuorumType), Resource: $($QuorumConfig.QuorumResource)"
+} catch {
+    Write-TestResult -TestName "ClusterMembership" -Result "FAIL" -Details "Node is not part of a cluster. Error: $_"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: ClusterMembership - RESULT: FAIL - DETAILS: Node is not part of a cluster. Error: $_"
+}
+
+# Test 3: Verify SQL Server installation
+Write-Host "Testing SQL Server installation..."
+try {
+    $SqlService = Get-Service -Name "MSSQLSERVER" -ErrorAction Stop
+    if ($SqlService.Status -eq "Running") {
+        Write-TestResult -TestName "SqlServerService" -Result "PASS" -Details "SQL Server service is running."
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerService - RESULT: PASS - DETAILS: SQL Server service is running."
+    } else {
+        Write-TestResult -TestName "SqlServerService" -Result "FAIL" -Details "SQL Server service is not running. Current status: $($SqlService.Status)"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerService - RESULT: FAIL - DETAILS: SQL Server service is not running. Current status: $($SqlService.Status)"
+    }
+    
+    # Test connectivity to SQL Server
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=localhost;Integrated Security=True;"
+    
+    try {
+        $SqlConnection.Open()
+        Write-TestResult -TestName "SqlServerConnectivity" -Result "PASS" -Details "Successfully connected to SQL Server."
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerConnectivity - RESULT: PASS - DETAILS: Successfully connected to SQL Server."
+        $SqlConnection.Close()
+    } catch {
+        Write-TestResult -TestName "SqlServerConnectivity" -Result "FAIL" -Details "Failed to connect to SQL Server. Error: $_"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerConnectivity - RESULT: FAIL - DETAILS: Failed to connect to SQL Server. Error: $_"
+    }
+    
+    # Check SQL Server version
+    try {
+        $SqlQuery = "SELECT @@VERSION as Version"
+        $SqlCmd = New-Object System.Data.SqlClient.SqlCommand($SqlQuery, $SqlConnection)
+        $SqlConnection.Open()
+        $SqlVersion = $SqlCmd.ExecuteScalar()
+        $SqlConnection.Close()
+        
+        Write-TestResult -TestName "SqlServerVersion" -Result "INFO" -Details "SQL Server Version: $SqlVersion"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerVersion - RESULT: INFO - DETAILS: SQL Server Version: $SqlVersion"
+    } catch {
+        Write-TestResult -TestName "SqlServerVersion" -Result "FAIL" -Details "Failed to retrieve SQL Server version. Error: $_"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerVersion - RESULT: FAIL - DETAILS: Failed to retrieve SQL Server version. Error: $_"
+    }
+} catch {
+    Write-TestResult -TestName "SqlServerService" -Result "FAIL" -Details "SQL Server service not found. Error: $_"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlServerService - RESULT: FAIL - DETAILS: SQL Server service not found. Error: $_"
+}
+
+# Test 4: Verify FSx connectivity
+Write-Host "Testing FSx connectivity..."
+try {
+    $FSxDnsName = "${fsx_dns_name}"
+    $FSxShareName = "${fsx_mount_name}"
+    $FSxPath = "\\$FSxDnsName\$FSxShareName"
+    
+    if (Test-Path -Path $FSxPath) {
+        Write-TestResult -TestName "FSxConnectivity" -Result "PASS" -Details "Successfully connected to FSx share at $FSxPath"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxConnectivity - RESULT: PASS - DETAILS: Successfully connected to FSx share at $FSxPath"
+        
+        # Check SQL folders on FSx
+        $SqlDataPath = "$FSxPath\SQLData"
+        $SqlLogsPath = "$FSxPath\SQLLogs"
+        
+        if (Test-Path -Path $SqlDataPath) {
+            Write-TestResult -TestName "FSxSqlDataFolder" -Result "PASS" -Details "SQL Data folder exists on FSx"
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxSqlDataFolder - RESULT: PASS - DETAILS: SQL Data folder exists on FSx"
+        } else {
+            Write-TestResult -TestName "FSxSqlDataFolder" -Result "FAIL" -Details "SQL Data folder does not exist on FSx"
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxSqlDataFolder - RESULT: FAIL - DETAILS: SQL Data folder does not exist on FSx"
+        }
+        
+        if (Test-Path -Path $SqlLogsPath) {
+            Write-TestResult -TestName "FSxSqlLogsFolder" -Result "PASS" -Details "SQL Logs folder exists on FSx"
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxSqlLogsFolder - RESULT: PASS - DETAILS: SQL Logs folder exists on FSx"
+        } else {
+            Write-TestResult -TestName "FSxSqlLogsFolder" -Result "FAIL" -Details "SQL Logs folder does not exist on FSx"
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxSqlLogsFolder - RESULT: FAIL - DETAILS: SQL Logs folder does not exist on FSx"
+        }
+    } else {
+        Write-TestResult -TestName "FSxConnectivity" -Result "FAIL" -Details "Failed to connect to FSx share at $FSxPath"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxConnectivity - RESULT: FAIL - DETAILS: Failed to connect to FSx share at $FSxPath"
+    }
+} catch {
+    Write-TestResult -TestName "FSxConnectivity" -Result "FAIL" -Details "Error testing FSx connectivity: $_"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: FSxConnectivity - RESULT: FAIL - DETAILS: Error testing FSx connectivity: $_"
+}
+
+# Test 5: Test SQL Server Failover Cluster Instance
+Write-Host "Testing SQL Server Failover Cluster Instance..."
+try {
+    $SqlClusterResource = Get-ClusterResource | Where-Object { $_.ResourceType -like "SQL Server*" }
+    
+    if ($SqlClusterResource) {
+        $SqlClusterGroupName = $SqlClusterResource.OwnerGroup
+        $SqlClusterGroup = Get-ClusterGroup -Name $SqlClusterGroupName
+        $CurrentOwnerNode = $SqlClusterGroup.OwnerNode
+        
+        Write-TestResult -TestName "SqlClusterResource" -Result "PASS" -Details "SQL Server clustered resource found: $($SqlClusterResource.Name), Owner: $($CurrentOwnerNode.Name)"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlClusterResource - RESULT: PASS - DETAILS: SQL Server clustered resource found: $($SqlClusterResource.Name), Owner: $($CurrentOwnerNode.Name)"
+        
+        # Only perform failover test on the primary node
+        if ($env:COMPUTERNAME -eq $CurrentOwnerNode.Name) {
+            Write-TestResult -TestName "FailoverTestPrep" -Result "INFO" -Details "This is the current owner node. Preparing for failover test."
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: FailoverTestPrep - RESULT: INFO - DETAILS: This is the current owner node. Preparing for failover test."
+            
+            # Get other nodes to failover to
+            $OtherNodes = Get-ClusterNode | Where-Object { $_.Name -ne $CurrentOwnerNode.Name -and $_.State -eq "Up" }
+            
+            if ($OtherNodes.Count -gt 0) {
+                $TargetNode = $OtherNodes[0].Name
+                
+                # Create test database before failover
+                Write-Host "Creating test database before failover..."
+                $TestDBName = "FailoverTest_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                $SqlCreateQuery = @"
+CREATE DATABASE [$TestDBName]
+GO
+USE [$TestDBName]
+GO
+CREATE TABLE TestTable (ID INT, TestData NVARCHAR(100))
+GO
+INSERT INTO TestTable VALUES (1, 'Test data before failover')
+GO
+"@
+                
+                try {
+                    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+                    $SqlConnection.ConnectionString = "Server=${cluster_name};Integrated Security=True;"
+                    $SqlConnection.Open()
+                    
+                    $SqlCmd = New-Object System.Data.SqlClient.SqlCommand($SqlCreateQuery, $SqlConnection)
+                    $SqlCmd.ExecuteNonQuery()
+                    $SqlConnection.Close()
+                    
+                    Write-TestResult -TestName "PreFailoverDatabaseCreate" -Result "PASS" -Details "Successfully created test database $TestDBName"
+                    Send-ToCloudWatch -Message "[$CurrentDate] TEST: PreFailoverDatabaseCreate - RESULT: PASS - DETAILS: Successfully created test database $TestDBName"
+                } catch {
+                    Write-TestResult -TestName "PreFailoverDatabaseCreate" -Result "FAIL" -Details "Failed to create test database: $_"
+                    Send-ToCloudWatch -Message "[$CurrentDate] TEST: PreFailoverDatabaseCreate - RESULT: FAIL - DETAILS: Failed to create test database: $_"
+                }
+                
+                # Perform the failover
+                Write-Host "Initiating failover to node $TargetNode..."
+                try {
+                    $Result = Move-ClusterGroup -Name $SqlClusterGroupName -Node $TargetNode
+                    Start-Sleep -Seconds 60 # Wait for failover to complete
+                    
+                    # Check if failover was successful
+                    $SqlClusterGroupAfter = Get-ClusterGroup -Name $SqlClusterGroupName
+                    
+                    if ($SqlClusterGroupAfter.OwnerNode.Name -eq $TargetNode) {
+                        Write-TestResult -TestName "SqlFailover" -Result "PASS" -Details "Successfully failed over SQL resource to $TargetNode"
+                        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlFailover - RESULT: PASS - DETAILS: Successfully failed over SQL resource to $TargetNode"
+                        
+                        # Verify database is accessible after failover
+                        $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+                        $SqlConnection.ConnectionString = "Server=${cluster_name};Integrated Security=True;"
+                        
+                        try {
+                            $SqlConnection.Open()
+                            $SqlQuery = "SELECT COUNT(*) FROM [$TestDBName].dbo.TestTable"
+                            $SqlCmd = New-Object System.Data.SqlClient.SqlCommand($SqlQuery, $SqlConnection)
+                            $RowCount = $SqlCmd.ExecuteScalar()
+                            $SqlConnection.Close()
+                            
+                            Write-TestResult -TestName "PostFailoverDatabaseAccess" -Result "PASS" -Details "Successfully accessed test database after failover. Row count: $RowCount"
+                            Send-ToCloudWatch -Message "[$CurrentDate] TEST: PostFailoverDatabaseAccess - RESULT: PASS - DETAILS: Successfully accessed test database after failover. Row count: $RowCount"
+                        } catch {
+                            Write-TestResult -TestName "PostFailoverDatabaseAccess" -Result "FAIL" -Details "Failed to access test database after failover: $_"
+                            Send-ToCloudWatch -Message "[$CurrentDate] TEST: PostFailoverDatabaseAccess - RESULT: FAIL - DETAILS: Failed to access test database after failover: $_"
+                        }
+                        
+                        # Move resources back to original node
+                        Write-Host "Moving resources back to original node..."
+                        try {
+                            Move-ClusterGroup -Name $SqlClusterGroupName -Node $CurrentOwnerNode.Name
+                            Write-TestResult -TestName "RestoreOriginalNode" -Result "PASS" -Details "Successfully moved resources back to $($CurrentOwnerNode.Name)"
+                            Send-ToCloudWatch -Message "[$CurrentDate] TEST: RestoreOriginalNode - RESULT: PASS - DETAILS: Successfully moved resources back to $($CurrentOwnerNode.Name)"
+                        } catch {
+                            Write-TestResult -TestName "RestoreOriginalNode" -Result "FAIL" -Details "Failed to move resources back: $_"
+                            Send-ToCloudWatch -Message "[$CurrentDate] TEST: RestoreOriginalNode - RESULT: FAIL - DETAILS: Failed to move resources back: $_"
+                        }
+                    } else {
+                        Write-TestResult -TestName "SqlFailover" -Result "FAIL" -Details "Failover attempted but SQL is still owned by $($SqlClusterGroupAfter.OwnerNode.Name)"
+                        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlFailover - RESULT: FAIL - DETAILS: Failover attempted but SQL is still owned by $($SqlClusterGroupAfter.OwnerNode.Name)"
+                    }
+                } catch {
+                    Write-TestResult -TestName "SqlFailover" -Result "FAIL" -Details "Failed to initiate failover: $_"
+                    Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlFailover - RESULT: FAIL - DETAILS: Failed to initiate failover: $_"
+                }
+            } else {
+                Write-TestResult -TestName "SqlFailover" -Result "SKIP" -Details "No other active nodes found to failover to"
+                Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlFailover - RESULT: SKIP - DETAILS: No other active nodes found to failover to"
+            }
+        } else {
+            Write-TestResult -TestName "SqlFailover" -Result "SKIP" -Details "Skipping failover test as this is not the owner node"
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlFailover - RESULT: SKIP - DETAILS: Skipping failover test as this is not the owner node"
+        }
+    } else {
+        Write-TestResult -TestName "SqlClusterResource" -Result "FAIL" -Details "No SQL Server clustered resource found"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlClusterResource - RESULT: FAIL - DETAILS: No SQL Server clustered resource found"
+    }
+} catch {
+    Write-TestResult -TestName "SqlClusterResource" -Result "FAIL" -Details "Error testing SQL Server cluster: $_"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: SqlClusterResource - RESULT: FAIL - DETAILS: Error testing SQL Server cluster: $_"
+}
+
+# Test 6: Test sample database
+Write-Host "Testing sample database..."
+try {
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=${cluster_name};Integrated Security=True;"
+    $SqlConnection.Open()
+    
+    $SqlCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT name FROM sys.databases WHERE name = 'TestDB'", $SqlConnection)
+    $TestDBExists = $SqlCmd.ExecuteScalar()
+    
+    if ($TestDBExists) {
+        Write-TestResult -TestName "TestDatabase" -Result "PASS" -Details "TestDB sample database exists"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: TestDatabase - RESULT: PASS - DETAILS: TestDB sample database exists"
+        
+        # Test database files location
+        $SqlQuery = @"
+SELECT 
+    DB_NAME(database_id) as DBName,
+    type_desc,
+    physical_name
+FROM sys.master_files
+WHERE DB_NAME(database_id) = 'TestDB'
+"@
+        
+        $SqlCmd = New-Object System.Data.SqlClient.SqlCommand($SqlQuery, $SqlConnection)
+        $SqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter($SqlCmd)
+        $DataSet = New-Object System.Data.DataSet
+        $SqlAdapter.Fill($DataSet)
+        
+        foreach ($Row in $DataSet.Tables[0].Rows) {
+            Write-TestResult -TestName "TestDBFileLocation" -Result "INFO" -Details "$($Row.DBName) $($Row.type_desc) file: $($Row.physical_name)"
+            Send-ToCloudWatch -Message "[$CurrentDate] TEST: TestDBFileLocation - RESULT: INFO - DETAILS: $($Row.DBName) $($Row.type_desc) file: $($Row.physical_name)"
+            
+            # Verify file is on FSx
+            if ($Row.physical_name -like "F:\SQL*\*") {
+                Write-TestResult -TestName "TestDBOnFSx" -Result "PASS" -Details "$($Row.type_desc) file is stored on FSx"
+                Send-ToCloudWatch -Message "[$CurrentDate] TEST: TestDBOnFSx - RESULT: PASS - DETAILS: $($Row.type_desc) file is stored on FSx"
+            } else {
+                Write-TestResult -TestName "TestDBOnFSx" -Result "FAIL" -Details "$($Row.type_desc) file is NOT stored on FSx"
+                Send-ToCloudWatch -Message "[$CurrentDate] TEST: TestDBOnFSx - RESULT: FAIL - DETAILS: $($Row.type_desc) file is NOT stored on FSx"
+            }
+        }
+    } else {
+        Write-TestResult -TestName "TestDatabase" -Result "FAIL" -Details "TestDB sample database does not exist"
+        Send-ToCloudWatch -Message "[$CurrentDate] TEST: TestDatabase - RESULT: FAIL - DETAILS: TestDB sample database does not exist"
+    }
+    
+    $SqlConnection.Close()
+} catch {
+    Write-TestResult -TestName "TestDatabase" -Result "FAIL" -Details "Error testing sample database: $_"
+    Send-ToCloudWatch -Message "[$CurrentDate] TEST: TestDatabase - RESULT: FAIL - DETAILS: Error testing sample database: $_"
+}
+
+# Test 7: Summary Report
+$TestResultsSummary = Get-Content -Path $TestResultsPath | Where-Object { $_ -like "*TEST:*" }
+$PassCount = ($TestResultsSummary | Where-Object { $_ -like "*RESULT: PASS*" }).Count
+$FailCount = ($TestResultsSummary | Where-Object { $_ -like "*RESULT: FAIL*" }).Count
+$InfoCount = ($TestResultsSummary | Where-Object { $_ -like "*RESULT: INFO*" }).Count
+$SkipCount = ($TestResultsSummary | Where-Object { $_ -like "*RESULT: SKIP*" }).Count
+$TotalTests = $PassCount + $FailCount
+
+$SummaryMessage = @"
+========== TEST SUMMARY ==========
+Date/Time: $CurrentDate
+Node: $NodeName
+Tests Run: $TotalTests
+Tests Passed: $PassCount
+Tests Failed: $FailCount
+Tests Skipped: $SkipCount
+Info Messages: $InfoCount
+Test Result File: $TestResultsPath
+=================================
+"@
+
+Write-Host $SummaryMessage
+$SummaryMessage | Out-File -FilePath $TestResultsPath -Append
+
+Send-ToCloudWatch -Message "[$CurrentDate] TEST SUMMARY - Passed: $PassCount, Failed: $FailCount, Skipped: $SkipCount, Info: $InfoCount"
+
+Stop-Transcript
+
+# Final message
+Write-Host "All tests completed. Results saved to $TestResultsPath and sent to CloudWatch log group $CloudWatchLogGroup."
+</powershell>
